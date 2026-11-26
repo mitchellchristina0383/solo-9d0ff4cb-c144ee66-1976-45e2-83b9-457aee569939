@@ -13,8 +13,10 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import pathlib
 import sys
 import tempfile
+import threading
 import time
 import zlib
 from pathlib import Path
@@ -23,10 +25,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import app as app_module  # noqa: E402
+import compressor  # noqa: E402
 from compressor import (  # noqa: E402
     BLOCK_COUNT,
+    COMPRESS_SLOTS,
     MAX_STAGED,
     SAMPLE,
+    JobSettings,
+    JobStartError,
 )
 
 SAMPLE_SHA = hashlib.sha256(SAMPLE).hexdigest()
@@ -161,6 +167,136 @@ def scenario_write_failure(client) -> dict:
     return snap
 
 
+def scenario_mkdir_failure_retry(client) -> None:
+    print("\n== 场景 C：作业目录创建失败（如卷只读/权限不足），随后安全重试 ==")
+    manager = app_module.manager
+    jobs_before = dict(manager._jobs)
+    real_mkdir = pathlib.Path.mkdir
+
+    def boom(self, *args, **kwargs):
+        if "jobs" in self.parts:
+            raise OSError("模拟 EACCES：建目录失败")
+        return real_mkdir(self, *args, **kwargs)
+
+    pathlib.Path.mkdir = boom
+    try:
+        failed = client.post("/api/jobs", json={"level": 6})
+    finally:
+        pathlib.Path.mkdir = real_mkdir
+    print("  首次开单 HTTP:", failed.status_code, failed.get_json())
+    check("建目录失败返回 500", failed.status_code == 500)
+    check("错误信息说明建目录失败", "创建作业目录失败" in failed.get_json()["error"])
+
+    # The failed attempt must not add any registry entry (earlier scenarios
+    # may already have jobs, so compare against the snapshot taken before).
+    check("失败的一单未注册、不占最近作业", manager._jobs == jobs_before
+          and (not jobs_before or manager.latest().id == next(reversed(jobs_before))))
+    jobs_root = Path(manager.data_dir) / "jobs"
+    new_dirs = [p for p in jobs_root.iterdir() if p.name not in jobs_before] \
+        if jobs_root.exists() else []
+    check("失败尝试未留下任何作业目录", new_dirs == [], str([p.name for p in new_dirs]))
+
+    retried = client.post("/api/jobs", json={"level": 6})
+    check("故障恢复后重试直接成功", retried.status_code == 201, str(retried.get_json()))
+    snap = wait(client, retried.get_json()["job_id"])[0]
+    check("重试作业正常完成", snap["state"] == "complete", str(snap.get("error")))
+    download = client.get(f"/api/jobs/{snap['job_id']}/download")
+    check("重试产物可下载且解压一致",
+          download.status_code == 200 and gzip.decompress(download.data) == SAMPLE)
+
+
+def scenario_partial_thread_failure_retry(client) -> None:
+    print("\n== 场景 D：仅部分压缩线程启动成功，回滚后安全重试 ==")
+    manager = app_module.manager
+    jobs_before = dict(manager._jobs)
+    real_start = threading.Thread.start
+    spawned: list[threading.Thread] = []
+
+    def flaky_start(self):
+        if self.name.startswith(f"compress-{COMPRESS_SLOTS - 1}-"):
+            raise RuntimeError("模拟第二个压缩位启动失败")
+        spawned.append(self)
+        return real_start(self)
+
+    threading.Thread.start = flaky_start
+    try:
+        failed = client.post("/api/jobs", json={"level": 6})
+    finally:
+        threading.Thread.start = real_start
+    print("  部分启动开单 HTTP:", failed.status_code, failed.get_json())
+    check("部分线程启动失败返回 500", failed.status_code == 500)
+    check("错误信息说明线程启动失败", "作业线程启动失败" in failed.get_json()["error"])
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and any(t.is_alive() for t in spawned):
+        time.sleep(0.05)
+    check("已启动的线程全部退出", all(not t.is_alive() for t in spawned),
+          str([(t.name, t.is_alive()) for t in spawned]))
+    check("失败的一单未注册（不可查询）", manager._jobs == jobs_before)
+
+    jobs_root = Path(manager.data_dir) / "jobs"
+    leftovers = [
+        str(p.relative_to(jobs_root))
+        for p in jobs_root.rglob("*")
+        if p.relative_to(jobs_root).parts[0] not in jobs_before
+    ] if jobs_root.exists() else []
+    check("本次临时文件与成品全部清掉", leftovers == [], str(leftovers))
+
+    retried = client.post("/api/jobs", json={"level": 6})
+    check("回滚后重试直接成功", retried.status_code == 201, str(retried.get_json()))
+    snap = wait(client, retried.get_json()["job_id"])[0]
+    check("重试作业完整起齐 3 个线程并完成",
+          snap["state"] == "complete"
+          and len(manager.get(snap["job_id"]).threads) == COMPRESS_SLOTS + 1)
+
+
+def scenario_conflict_during_startup(client) -> None:
+    print("\n== 场景 E：启动窗口内另一单 409，旧备份仍可查可下 ==")
+    old = client.post("/api/jobs", json={"level": 6})
+    old_id = old.get_json()["job_id"]
+    assert wait(client, old_id)[0]["state"] == "complete"
+
+    gate_held = threading.Event()
+    release = threading.Event()
+    real_start = compressor.Job.start
+
+    def slow_start(self):
+        gate_held.set()
+        assert release.wait(10)
+        return real_start(self)
+
+    compressor.Job.start = slow_start
+    holder_error: list[Exception] = []
+
+    def hold_gate():
+        try:
+            app_module.manager.create(JobSettings(level=6))
+        except Exception as exc:  # pragma: no cover - surfaced via holder_error
+            holder_error.append(exc)
+
+    holder = threading.Thread(target=hold_gate)
+    holder.start()
+    assert gate_held.wait(10)
+    time.sleep(0.1)
+    try:
+        conflict = client.post("/api/jobs", json={"level": 6})
+        check("启动/清理期间另一单返回 409", conflict.status_code == 409,
+              str(conflict.get_json()))
+        old_snap = client.get(f"/api/jobs/{old_id}").get_json()
+        check("旧备份仍可查询", old_snap["state"] == "complete"
+              and old_snap["download_ready"] is True)
+        check("旧备份仍可下载",
+              client.get(f"/api/jobs/{old_id}/download").status_code == 200)
+    finally:
+        release.set()
+        holder.join(15)
+        compressor.Job.start = real_start
+    check("持闸的那一单最终成功", holder_error == [])
+    new_job = app_module.manager.latest()
+    new_job.wait(30)
+    check("新作业注册并完成", new_job.snapshot()["state"] == "complete")
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="drill-verify-"))
     app_module.manager = app_module._prepare_data_dir(tmp)
@@ -179,6 +315,9 @@ def main() -> int:
 
         scenario_slow_block(client)
         scenario_write_failure(client)
+        scenario_mkdir_failure_retry(client)
+        scenario_partial_thread_failure_retry(client)
+        scenario_conflict_during_startup(client)
 
     print("\n== 结果 ==")
     if failures:

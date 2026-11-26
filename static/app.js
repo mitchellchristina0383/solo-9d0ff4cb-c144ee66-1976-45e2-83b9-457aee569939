@@ -126,6 +126,8 @@ function addSlowBlock() {
 async function startJob(event) {
   event.preventDefault();
   $("form-error").textContent = "";
+  const startButton = $("start");
+  startButton.disabled = true;
   const payload = {
     level: Number($("level").value),
     base_delay_ms: Number($("base-delay").value) || 0,
@@ -139,7 +141,11 @@ async function startJob(event) {
     applyJob(job);
     startPolling(job.job_id);
   } catch (err) {
-    $("form-error").textContent = err.message;
+    // A 409/500 here means no job was created (or the attempt was rolled
+    // back): nothing is running, so starting again must stay possible.
+    $("form-error").textContent = `开单失败，可重试：${err.message}`;
+    startButton.disabled = false;
+    $("fail-now").disabled = true;
   }
 }
 

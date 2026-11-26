@@ -65,6 +65,18 @@ next_claim - next_write < MAX_STAGED(=2)   # 才允许领取下一块
 - 下载接口只对 `complete` 放行，其余一律 `409`；页面的下载按钮保持禁用。
 - 取消作业走同一条清理路径。
 
+### 5. 开单是原子操作：全部线程起来之前，这单不存在
+
+- 开单 = 建作业目录 → 启动 1 个写入线程 + 2 个压缩线程。只有两步全部成功，作业才会被
+  注册：此后才能按 id 查询、进入「最近作业」、参与旧包淘汰（保留最近 8 单）。
+- **建目录失败**（卷只读/权限不足等）或**任一线程启动失败**（只起来部分线程）：
+  接口返回 `500` 并说明原因；已启动的线程会被立刻叫停并等待退出，本次作业目录
+  （含 `.part` 和任何成品）整个删掉，注册表不留任何痕迹——所以同一张页面可以直接重试，
+  不会再撞「已有作业运行中」，也不可能产出可下载的残包。
+- 启动或回滚清理期间再点「开始」立刻得到 `409`（另一作业正在启动或清理中）；这把开单闸
+  与查询/下载路径分开，旧备份在整个窗口内始终可查询、可下载。
+
+
 ## 页面
 
 | 区域 | 内容 |
@@ -87,14 +99,20 @@ next_claim - next_write < MAX_STAGED(=2)   # 才允许领取下一块
 | POST | `/api/jobs/<id>/cancel` | 取消并清理 |
 | GET | `/api/jobs/<id>/download` | 成功才返回 `application/gzip`，否则 409 |
 
-同一时刻只允许一个作业（状态在内存中），重复创建返回 409。
+同一时刻只允许一个作业（状态在内存中），重复创建返回 409。`POST /api/jobs` 的状态码：
+
+- `201`：目录已建好且全部线程启动成功，作业开始运行。
+- `400`：入参校验失败（没有任何线程被启动，可直接改参数重试）。
+- `409`：已有作业运行中，或另一单正处于启动/回滚清理窗口。
+- `500`：建目录或线程启动失败；本次尝试已完整回滚（线程退出、目录删净、未注册），
+  排除故障后用同样的请求重试即可。
 
 ## 验证
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests -q                 # 28 项：管线不变量 + Flask API
-python scripts/verify_drill.py            # 场景化演练：慢块 + 写盘失败，逐项 PASS/FAIL
+python -m pytest tests -q                 # 35 项：管线不变量 + Flask API + 原子开单回滚
+python scripts/verify_drill.py            # 场景化演练：慢块、写盘失败、建目录/线程启动失败重试、开单 409
 ```
 
 可选的前端冒烟测试（需要 `npm i` 装 jsdom，并在 `BASE_URL` 指向的服务器运行时）：
@@ -103,6 +121,8 @@ python scripts/verify_drill.py            # 场景化演练：慢块 + 写盘失
 npm install
 BASE_URL=http://127.0.0.1:8000 node tests/ui_smoke.js
 BASE_URL=http://127.0.0.1:8000 node tests/ui_failure_smoke.js
+# 开单失败重试：需要一个让 POST /api/jobs 启动失败的服务器（如注入线程启动故障）
+BASE_URL=http://127.0.0.1:8000 node tests/ui_retry_smoke.js
 ```
 
 ## 目录

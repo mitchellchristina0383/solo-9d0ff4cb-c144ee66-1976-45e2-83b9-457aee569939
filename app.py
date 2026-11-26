@@ -34,6 +34,7 @@ from compressor import (
     JobError,
     JobManager,
     JobSettings,
+    JobStartError,
     NotFound,
 )
 
@@ -170,6 +171,10 @@ def create_job():
     try:
         settings = _parse_settings(payload)
         job = manager.create(settings)
+    except JobStartError as exc:
+        # Directory creation or thread start failed; the attempt was fully
+        # rolled back and the same request can be retried immediately.
+        return jsonify({"error": str(exc)}), 500
     except JobError as exc:
         status = 409 if isinstance(exc, Conflict) else 400
         return jsonify({"error": str(exc)}), status

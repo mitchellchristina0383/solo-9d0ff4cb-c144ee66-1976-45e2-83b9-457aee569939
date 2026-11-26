@@ -22,6 +22,16 @@ The writer writes to ``backup.gz.part``.  On a simulated disk failure the job
 is terminated, workers are stopped, staged fragments are dropped and both the
 partial and final paths are removed.  Only a successfully finished job renames
 the partial file to ``backup.gz`` and becomes downloadable.
+
+Starting a job is atomic: ``Job.start`` must create the job directory and
+bring up the writer plus every compression worker.  If either step fails, the
+attempt rolls itself back (started threads are signalled and joined, the whole
+job directory is removed) and raises ``JobStartError``.  The registry only
+admits a job after a fully successful start, so a failed attempt is invisible
+to queries, never updates "latest"/pruning and can be retried immediately.
+``JobManager`` serialises start attempts behind a non-blocking creation gate:
+a concurrent order gets a ``Conflict`` (HTTP 409) while lookups and downloads
+of older backups remain unaffected.
 """
 
 from __future__ import annotations
@@ -51,6 +61,10 @@ MAX_LEVEL = 9
 DEFAULT_LEVEL = 6
 MAX_DELAY_MS = 10_000
 MAX_BASE_DELAY_MS = 5_000
+
+# How long an aborted start waits for already-spawned threads to exit before
+# removing the job directory.
+START_ABORT_JOIN_TIMEOUT = 10.0
 
 
 # --- the built-in backup sample --------------------------------------------
@@ -96,11 +110,21 @@ class JobError(Exception):
 
 
 class Conflict(JobError):
-    """A job is already running."""
+    """A job is already running (or another one is starting/cleaning up)."""
 
 
 class NotFound(JobError):
     """Unknown job id."""
+
+
+class JobStartError(JobError):
+    """The job directory or a pipeline thread could not be started.
+
+    Raised only by :meth:`Job.start`, which rolls the whole attempt back
+    first: every already-started thread is stopped and the job directory
+    (partial/final files included) is removed, so the caller can safely
+    retry from scratch.
+    """
 
 
 # --- gzip primitives --------------------------------------------------------
@@ -320,21 +344,80 @@ class Job:
     # -- lifecycle -------------------------------------------------------
 
     def start(self) -> None:
-        self.job_dir.mkdir(parents=True, exist_ok=True)
-        writer = threading.Thread(
-            target=self._writer_main, name=f"writer-{self.id}", daemon=True
-        )
-        writer.start()
-        self.threads.append(writer)
-        for slot in range(COMPRESS_SLOTS):
-            worker = threading.Thread(
-                target=self._compress_main,
-                args=(slot,),
-                name=f"compress-{slot}-{self.id}",
-                daemon=True,
+        """Atomically create the job directory and start *every* thread.
+
+        A job becomes visible/queryable only after this returns normally:
+        the registry adds it after a successful start.  If the directory
+        cannot be created or any of the 1 writer + COMPRESS_SLOTS worker
+        threads fails to start, the whole attempt is rolled back — running
+        threads are signalled to stop and joined, then everything this
+        attempt put on disk is deleted — and :class:`JobStartError` is
+        raised, leaving the state ready for a fresh retry.
+        """
+        try:
+            self.job_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._abort_start(f"创建作业目录失败：{exc}")
+            raise JobStartError(f"创建作业目录失败：{exc}") from exc
+
+        try:
+            writer = threading.Thread(
+                target=self._writer_main, name=f"writer-{self.id}", daemon=True
             )
-            worker.start()
-            self.threads.append(worker)
+            writer.start()
+            self.threads.append(writer)
+            for slot in range(COMPRESS_SLOTS):
+                worker = threading.Thread(
+                    target=self._compress_main,
+                    args=(slot,),
+                    name=f"compress-{slot}-{self.id}",
+                    daemon=True,
+                )
+                worker.start()
+                self.threads.append(worker)
+        except BaseException as exc:  # e.g. RuntimeError from Thread.start
+            self._abort_start(f"作业线程启动失败（仅部分线程启动）：{exc!r}")
+            raise JobStartError(
+                f"作业线程启动失败（仅部分线程启动）：{exc!r}"
+            ) from exc
+
+    def _abort_start(self, message: str) -> None:
+        """Roll back a start that did not get every thread running.
+
+        Marks the job failed, stops every thread that did start, waits for
+        them to exit and removes the whole job directory (``.part`` and any
+        final file included).  Nothing from this attempt may survive, so the
+        same request can be safely retried afterwards.
+        """
+        with self.cond:
+            if self.state == "running":
+                self.state = "failed"
+                self.error = message
+                self.finished_at = time.monotonic()
+            self.stop_event.set()
+            self._drop_staged_locked()
+            self.cond.notify_all()
+
+        lingering: list[str] = []
+        for thread in self.threads:
+            thread.join(START_ABORT_JOIN_TIMEOUT)
+            if thread.is_alive():
+                lingering.append(thread.name)
+
+        # Threads are daemon and the writer closes its file handle in
+        # finally/abort; only delete once they have actually exited so no
+        # open handle or half-written fragment is left behind.  If a thread
+        # somehow did not exit in time, still attempt the removal best-effort
+        # (rmtree tolerates individual failures) so a failed start can never
+        # leave an orphan directory behind; process startup also wipes the
+        # jobs root as a final backstop.
+        if lingering:
+            self.error = (
+                f"{message}；以下线程未在 {START_ABORT_JOIN_TIMEOUT:.0f}s 内退出："
+                + ", ".join(lingering)
+            )
+        shutil.rmtree(self.job_dir, ignore_errors=True)
+
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -540,35 +623,63 @@ class ArchiveWriter:
 
 
 class JobManager:
-    """In-memory registry; gunicorn must run a single process (threads)."""
+    """In-memory registry; gunicorn must run a single process (threads).
+
+    Two locks keep different concerns apart:
+
+    * ``_registry_lock`` guards the job dictionary (register/get/prune).
+      Lookups and downloads take it only briefly, so an old backup stays
+      queryable while another job is starting or being rolled back.
+    * ``_creation_gate`` serialises the whole start-or-rollback window.
+      A second create attempt while the gate is held gets an immediate
+      :class:`Conflict` (HTTP 409) instead of waiting; the gate also
+      guarantees no two start attempts ever touch the disk concurrently.
+    """
 
     def __init__(self, data_dir: Path, keep: int = 8) -> None:
         self.data_dir = Path(data_dir)
         self.keep = keep
         self._jobs: dict[str, Job] = {}
-        self._lock = threading.Lock()
+        self._registry_lock = threading.Lock()
+        self._creation_gate = threading.Lock()
 
     def create(self, settings: JobSettings) -> Job:
-        with self._lock:
-            running = [j for j in self._jobs.values() if j.state == "running"]
-            if running:
-                raise Conflict(f"已有作业 {running[0].id} 正在运行，请先等待或取消")
-            job_id = uuid.uuid4().hex[:12]
-            job = Job(job_id, settings, self.data_dir)
-            self._jobs[job_id] = job
-            self._prune_locked()
-        job.start()
-        return job
+        # Non-blocking: while another attempt is starting (or rolling back
+        # after a failed start), this order is rejected with 409 at once.
+        if not self._creation_gate.acquire(blocking=False):
+            raise Conflict("另一个作业正在启动或清理中，请稍后再试")
+        try:
+            with self._registry_lock:
+                running = [j for j in self._jobs.values() if j.state == "running"]
+                if running:
+                    raise Conflict(
+                        f"已有作业 {running[0].id} 正在运行，请先等待或取消"
+                    )
+                job_id = uuid.uuid4().hex[:12]
+                job = Job(job_id, settings, self.data_dir)
+
+            # Start outside the registry lock: a rolled-back start must not
+            # block GET /api/jobs/<id> or downloads of older backups.
+            job.start()
+
+            # The directory exists and every thread is running — only now is
+            # the job registered, queryable and eligible for "latest"/prune.
+            with self._registry_lock:
+                self._jobs[job_id] = job
+                self._prune_locked()
+            return job
+        finally:
+            self._creation_gate.release()
 
     def get(self, job_id: str) -> Job:
-        with self._lock:
+        with self._registry_lock:
             job = self._jobs.get(job_id)
         if job is None:
             raise NotFound(f"未知作业 {job_id}")
         return job
 
     def latest(self) -> Optional[Job]:
-        with self._lock:
+        with self._registry_lock:
             if not self._jobs:
                 return None
             return next(reversed(self._jobs.values()))

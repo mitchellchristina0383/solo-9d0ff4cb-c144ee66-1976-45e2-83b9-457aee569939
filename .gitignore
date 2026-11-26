@@ -5,3 +5,7 @@ data/
 verify_output/
 node_modules/
 package-lock.json
+.pydeps/
+.pyuser/
+.venv/
+.npm-cache/

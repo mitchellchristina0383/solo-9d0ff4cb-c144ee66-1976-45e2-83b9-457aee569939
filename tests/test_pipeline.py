@@ -5,7 +5,9 @@ from __future__ import annotations
 import gzip
 import hashlib
 import importlib
+import pathlib
 import sys
+import threading
 import time
 import zlib
 from pathlib import Path
@@ -17,10 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import compressor  # noqa: E402
 from compressor import (  # noqa: E402
     BLOCK_COUNT,
+    COMPRESS_SLOTS,
     MAX_STAGED,
     SAMPLE,
+    Conflict,
     JobManager,
     JobSettings,
+    JobStartError,
     run_job,
 )
 
@@ -180,6 +185,164 @@ def test_cancel_releases_staging_and_artifact(workdir):
 
 
 # ---------------------------------------------------------------------------
+# atomic start: directory / thread startup failures must roll back cleanly
+# ---------------------------------------------------------------------------
+
+
+def test_start_mkdir_failure_rolls_back_and_is_retryable(workdir, monkeypatch):
+    real_mkdir = pathlib.Path.mkdir
+
+    def boom(self, *args, **kwargs):
+        if "jobs" in self.parts:
+            raise OSError("模拟 EACCES：建目录失败")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "mkdir", boom)
+    manager = JobManager(workdir)
+    with pytest.raises(JobStartError, match="创建作业目录失败"):
+        manager.create(JobSettings(level=6))
+
+    # The failed attempt never reached the registry: it is not queryable and
+    # "latest" is unchanged, so a retry cannot be blocked by a phantom job.
+    assert manager._jobs == {}
+    assert manager.latest() is None
+
+    jobs_root = workdir / "jobs"
+    assert not jobs_root.exists() or list(jobs_root.iterdir()) == []
+
+    # Same request retried once the disk condition is fixed.
+    monkeypatch.undo()
+    job = manager.create(JobSettings(level=6))
+    assert job.wait(timeout=30) is True
+    snap = job.snapshot()
+    assert snap["state"] == "complete"
+    assert snap["download_ready"] is True
+    assert decompressed(job.final_path) == SAMPLE
+
+
+def test_partial_thread_start_failure_stops_threads_and_wipes_artifact(
+    workdir, monkeypatch
+):
+    manager = JobManager(workdir)
+    real_start = threading.Thread.start
+    spawned: list[threading.Thread] = []
+
+    def flaky_start(self):
+        # The second compression slot never comes up; the writer and slot 0
+        # are already running by then.
+        if self.name.startswith(f"compress-{COMPRESS_SLOTS - 1}-"):
+            raise RuntimeError("模拟线程启动失败（只起来部分线程）")
+        spawned.append(self)
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", flaky_start)
+    with pytest.raises(JobStartError, match="作业线程启动失败"):
+        manager.create(JobSettings(level=6, base_delay_ms=50))
+
+    # Not registered => GET /api/jobs/<id> would 404; no partial backup can
+    # ever become downloadable.
+    assert manager._jobs == {}
+    assert manager.latest() is None
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and any(t.is_alive() for t in spawned):
+        time.sleep(0.05)
+    assert all(not t.is_alive() for t in spawned)
+
+    # Everything this attempt put on disk is gone (job dir incl. .part/.gz).
+    jobs_root = workdir / "jobs"
+    assert list(jobs_root.rglob("*")) == []
+
+    # Retry with healthy threads: full pipeline runs and is downloadable.
+    monkeypatch.undo()
+    job = manager.create(JobSettings(level=6))
+    assert job.wait(timeout=30) is True
+    snap = job.snapshot()
+    assert snap["state"] == "complete"
+    assert len(job.threads) == COMPRESS_SLOTS + 1
+    assert all(not t.is_alive() for t in job.threads)
+    assert job.final_path.is_file()
+    assert decompressed(job.final_path) == SAMPLE
+
+
+def test_second_create_during_startup_gets_conflict_but_old_backup_stays_served(
+    workdir, monkeypatch
+):
+    manager = JobManager(workdir)
+    old_job = manager.create(JobSettings(level=6))
+    assert old_job.wait(timeout=30) is True
+
+    gate_held = threading.Event()
+    release = threading.Event()
+    real_start = compressor.Job.start
+
+    def slow_start(self):
+        gate_held.set()
+        assert release.wait(10)
+        return real_start(self)
+
+    monkeypatch.setattr(compressor.Job, "start", slow_start)
+    holder_error: list[Exception] = []
+
+    def hold_gate():
+        try:
+            manager.create(JobSettings(level=6))
+        except Exception as exc:  # pragma: no cover - surfaced below
+            holder_error.append(exc)
+
+    holder = threading.Thread(target=hold_gate)
+    holder.start()
+    assert gate_held.wait(10)
+    time.sleep(0.1)
+    try:
+        # Another order while the first is in its start/rollback window.
+        with pytest.raises(Conflict):
+            manager.create(JobSettings(level=6))
+        # Reads and downloads never take the creation gate.
+        snap = manager.get(old_job.id).snapshot()
+        assert snap["state"] == "complete" and snap["download_ready"] is True
+        assert old_job.final_path.is_file()
+    finally:
+        release.set()
+        holder.join(15)
+
+    assert holder_error == []
+    new_job = manager.latest()
+    assert new_job is not old_job
+    assert new_job.wait(timeout=30) is True
+    assert new_job.snapshot()["state"] == "complete"
+
+
+def test_failed_start_does_not_touch_latest_or_pruning(workdir):
+    manager = JobManager(workdir, keep=2)
+    first = manager.create(JobSettings(level=6))
+    assert first.wait(timeout=30) is True
+
+    real_mkdir = pathlib.Path.mkdir
+
+    def boom(self, *args, **kwargs):
+        if "jobs" in self.parts:
+            raise OSError("模拟 EACCES：建目录失败")
+        return real_mkdir(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pathlib.Path, "mkdir", boom)
+        with pytest.raises(JobStartError):
+            manager.create(JobSettings(level=6))
+
+    # "latest" still points at the last *successful* job.
+    assert manager.latest().id == first.id
+
+    ids = []
+    for _ in range(3):
+        job = manager.create(JobSettings(level=6))
+        assert job.wait(timeout=30) is True
+        ids.append(job.id)
+    # Original keep/prune rule preserved: newest two survive.
+    assert set(manager._jobs) == set(ids[-2:])
+
+
+# ---------------------------------------------------------------------------
 # Flask API
 # ---------------------------------------------------------------------------
 
@@ -294,6 +457,116 @@ def test_api_conflict_when_job_running(client):
     job_id = first.get_json()["job_id"]
     client.post(f"/api/jobs/{job_id}/cancel")
     _wait_for(client, job_id)
+
+
+def test_api_start_failure_returns_500_and_retry_succeeds(client, monkeypatch):
+    import app as app_module
+
+    real_mkdir = pathlib.Path.mkdir
+
+    def boom(self, *args, **kwargs):
+        if "jobs" in self.parts:
+            raise OSError("模拟 EACCES：建目录失败")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "mkdir", boom)
+    failed = client.post("/api/jobs", json={"level": 6})
+    assert failed.status_code == 500
+    assert "创建作业目录失败" in failed.get_json()["error"]
+
+    # Nothing was registered: the phantom id is unknown and latest is empty.
+    assert client.get("/api/jobs/latest").get_json()["latest"] is None
+    monkeypatch.undo()
+
+    # The very next order on the same page goes through.
+    retried = client.post("/api/jobs", json={"level": 6})
+    assert retried.status_code == 201, retried.get_json()
+    job_id = retried.get_json()["job_id"]
+    snap = _wait_for(client, job_id)
+    assert snap["state"] == "complete"
+    assert client.get(f"/api/jobs/{job_id}/download").status_code == 200
+
+
+def test_api_partial_thread_start_failure_is_invisible_and_retryable(
+    client, monkeypatch
+):
+    import app as app_module
+
+    real_start = threading.Thread.start
+
+    def flaky_start(self):
+        if self.name.startswith(f"compress-{COMPRESS_SLOTS - 1}-"):
+            raise RuntimeError("模拟线程启动失败（只起来部分线程）")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", flaky_start)
+    failed = client.post("/api/jobs", json={"level": 6})
+    assert failed.status_code == 500
+    assert "作业线程启动失败" in failed.get_json()["error"]
+    monkeypatch.undo()
+
+    # The rolled-back job id must not be discoverable.
+    assert client.get("/api/jobs/latest").get_json()["latest"] is None
+
+    retried = client.post("/api/jobs", json={"level": 6})
+    assert retried.status_code == 201
+    snap = _wait_for(client, retried.get_json()["job_id"])
+    assert snap["state"] == "complete"
+
+    # Only the retried job's directory remains; the failed attempt left none.
+    jobs_root = pathlib.Path(app_module.manager.data_dir) / "jobs"
+    assert [p.name for p in jobs_root.iterdir()] == [retried.get_json()["job_id"]]
+    assert not list(jobs_root.rglob("*.part"))
+
+
+def test_api_409_while_starting_but_old_backup_still_downloadable(client, monkeypatch):
+    old = client.post("/api/jobs", json={"level": 6})
+    assert old.status_code == 201
+    old_id = old.get_json()["job_id"]
+    assert _wait_for(client, old_id)["state"] == "complete"
+
+    import app as app_module
+
+    gate_held = threading.Event()
+    release = threading.Event()
+    real_start = compressor.Job.start
+
+    def slow_start(self):
+        gate_held.set()
+        assert release.wait(10)
+        return real_start(self)
+
+    monkeypatch.setattr(compressor.Job, "start", slow_start)
+    holder_error: list[Exception] = []
+
+    def hold_gate():
+        # Drive the manager directly: the Flask test client executes requests
+        # inline in the calling thread, which would deadlock against release.
+        try:
+            app_module.manager.create(JobSettings(level=6))
+        except Exception as exc:  # pragma: no cover - surfaced below
+            holder_error.append(exc)
+
+    holder = threading.Thread(target=hold_gate)
+    holder.start()
+    assert gate_held.wait(10)
+    time.sleep(0.1)
+    try:
+        conflict = client.post("/api/jobs", json={"level": 6})
+        assert conflict.status_code == 409
+        # Old backup remains fully available during the start window.
+        old_snap = client.get(f"/api/jobs/{old_id}").get_json()
+        assert old_snap["download_ready"] is True
+        assert client.get(f"/api/jobs/{old_id}/download").status_code == 200
+    finally:
+        release.set()
+        holder.join(15)
+
+    assert holder_error == []
+    new_job = app_module.manager.latest()
+    assert new_job is not app_module.manager.get(old_id)
+    assert new_job.wait(timeout=30) is True
+    assert new_job.snapshot()["state"] == "complete"
 
 
 @pytest.mark.parametrize(
