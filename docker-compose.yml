@@ -1,0 +1,32 @@
+services:
+  drill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ordered-gzip-drill:latest
+    container_name: ordered-gzip-drill
+    ports:
+      - "${DRILL_PORT:-8000}:8000"
+    environment:
+      PORT: "8000"
+      DRILL_DATA_DIR: /data
+    volumes:
+      - drill-data:/data
+    tmpfs:
+      - /tmp:size=32m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/meta', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  drill-data:

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>乱序压缩 · 顺序落盘 · gzip 演练台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>乱序压缩 · 顺序落盘</h1>
+  <p class="sub">两个压缩位并行压块，按原块序写进同一个 gzip。后面的块可以先压好，但暂存最多两块；轮到写入的块永远不会被暂存挡住。</p>
+</header>
+
+<main>
+  <section class="panel controls">
+    <form id="job-form" autocomplete="off">
+      <div class="field-row">
+        <label for="level">压缩级别</label>
+        <input id="level" name="level" type="number" min="1" max="9" value="6">
+        <span class="hint">1–9，级别越高越慢</span>
+      </div>
+
+      <div class="field-row">
+        <label for="base-delay">演示节奏</label>
+        <input id="base-delay" name="base-delay" type="number" min="0" max="5000" step="20" value="120">
+        <span class="unit">ms / 块</span>
+        <span class="hint">每块模拟读取耗时，让块的先后变化看得见</span>
+      </div>
+
+      <div class="field-row">
+        <label for="slow-block">拖慢指定块</label>
+        <select id="slow-block" name="slow-block"></select>
+        <input id="slow-delay" name="slow-delay" type="number" min="0" max="10000" step="50" value="900" title="延迟毫秒">
+        <span class="unit">ms</span>
+        <button type="button" id="add-slow" class="ghost">添加</button>
+        <span class="hint">选块、填延迟后点“添加”，最多 4 块</span>
+      </div>
+      <div id="slow-list" class="chip-list" aria-live="polite"></div>
+
+      <div class="field-row">
+        <label for="fail-at">模拟写盘失败</label>
+        <select id="fail-at" name="fail-at">
+          <option value="">不模拟</option>
+        </select>
+        <span class="hint">在第 N 次块写入时抛错，作业终止且不留残包</span>
+      </div>
+
+      <div class="actions">
+        <button id="start" type="submit" class="primary">开始压制备份</button>
+        <button id="fail-now" type="button" class="danger" disabled>立刻写盘失败</button>
+        <button id="cancel" type="button" class="ghost" disabled>取消作业</button>
+        <span id="form-error" class="error-text" role="alert"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel status">
+    <div class="status-head">
+      <h2>作业 <code id="job-id">—</code></h2>
+      <span id="state-badge" class="badge idle">空闲</span>
+    </div>
+    <div class="metrics">
+      <div class="metric"><span class="label">已压缩块</span><strong id="m-compressed">0 / 16</strong></div>
+      <div class="metric"><span class="label">已写完块</span><strong id="m-written">0 / 16</strong></div>
+      <div class="metric"><span class="label">暂存峰值</span><strong id="m-peak">0</strong><span class="cap">上限 2</span></div>
+      <div class="metric"><span class="label">当前暂存</span><strong id="m-staging">0</strong></div>
+      <div class="metric"><span class="label">在途（已领未写）</span><strong id="m-inflight">0</strong><span class="cap">峰值 <span id="m-inflight-peak">0</span>，含线程内</span></div>
+      <div class="metric"><span class="label">耗时</span><strong id="m-elapsed">0.00s</strong></div>
+      <div class="metric"><span class="label">gzip 大小</span><strong id="m-size">—</strong></div>
+    </div>
+    <p id="job-message" class="job-message" role="status"></p>
+    <div class="order-rows">
+      <div class="order-row"><span class="label">压完顺序</span><code id="order-compressed">—</code></div>
+      <div class="order-row"><span class="label">写完顺序</span><code id="order-written">—</code></div>
+    </div>
+  </section>
+
+  <section class="panel board">
+    <div class="board-head">
+      <h2>块轨道</h2>
+      <div class="legend">
+        <span class="dot pending"></span>待压
+        <span class="dot compressing"></span>压缩中
+        <span class="dot compressed"></span>已压好·暂存
+        <span class="dot written"></span>已写入
+        <span class="dot slow"></span>被拖慢
+        <span class="dot dropped"></span>已丢弃
+      </div>
+    </div>
+    <div id="blocks" class="blocks"></div>
+  </section>
+
+  <section class="panel download">
+    <div class="download-row">
+      <a id="download-link" class="primary disabled" href="#" download>下载 backup.gz</a>
+      <button id="verify" type="button" class="ghost" disabled>在浏览器里解压校验</button>
+      <span id="verify-result" class="hint"></span>
+    </div>
+    <div class="hash-row">
+      <span>样例 SHA-256</span><code id="sample-sha">—</code>
+    </div>
+  </section>
+
+  <section class="panel notes">
+    <h2>演练说明</h2>
+    <ul>
+      <li>16 个 48 KiB 块 = 768 KiB 内置备份样例；两个压缩位轮流领块，写入器严格按块号写。</li>
+      <li>领块前先占一个“已领未写”名额，名额上限 2，所以已压好待写、或还留在压缩线程里的块合计最多 2 块；压缩位因此会自然等写入器让出名额。</li>
+      <li>被拖慢的块只占住它自己的压缩位和名额，写入器从不因后面的暂存块而跳过它——轮到谁写谁。</li>
+      <li>写盘失败会立刻结束作业、释放暂存、删除残包；页面报错且下载按钮保持禁用。</li>
+      <li>解压校验：浏览器拿到 gzip 后用 <code>DecompressionStream('gzip')</code> 解压，和 <code>/api/sample</code> 对比 SHA-256。</li>
+    </ul>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

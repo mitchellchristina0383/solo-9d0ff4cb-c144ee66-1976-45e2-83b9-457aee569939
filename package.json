@@ -1,0 +1,11 @@
+{
+  "name": "ordered-gzip-drill-ui-tests",
+  "private": true,
+  "description": "Optional jsdom smoke tests for the drill page UI",
+  "scripts": {
+    "test:ui": "node tests/ui_smoke.js && node tests/ui_failure_smoke.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.3"
+  }
+}
